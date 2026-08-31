@@ -5,12 +5,41 @@ from pathlib import Path
 
 import psutil
 
-from .temporary_deployment import ShippingProcessWatcher, _process_identity
+from .temporary_deployment import (
+    DeploymentLogger,
+    ShippingProcessWatcher,
+    TemporaryDeploymentManager,
+    _process_identity,
+)
 
 
 class FullDeploymentShippingWatcher(ShippingProcessWatcher):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        manager: TemporaryDeploymentManager,
+        *,
+        shipping_process_name: str,
+        session_started_at: float,
+        shipping_executable_path: Path | None = None,
+        launch_timeout: float = 15.0 * 60.0,
+        poll_interval: float = 1.0,
+        launcher_process_name: str | None = None,
+        launch_start_timeout: float | None = None,
+        launcher_exit_grace: float | None = None,
+        log: DeploymentLogger | None = None,
+    ) -> None:
+        super().__init__(
+            manager,
+            shipping_process_name=shipping_process_name,
+            session_started_at=session_started_at,
+            shipping_executable_path=shipping_executable_path,
+            launch_timeout=launch_timeout,
+            poll_interval=poll_interval,
+            launcher_process_name=launcher_process_name,
+            launch_start_timeout=launch_start_timeout,
+            launcher_exit_grace=launcher_exit_grace,
+            log=log,
+        )
         self.shipping_seen = False
         self._last_wait_log = 0.0
         self._last_candidate_log = 0.0
