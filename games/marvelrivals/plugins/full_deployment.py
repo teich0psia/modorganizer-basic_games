@@ -10,10 +10,10 @@ from PyQt6.QtWidgets import QMessageBox
 import mobase
 
 from ..full_deployment import FullDeploymentManager
+from ..full_watcher import FullDeploymentShippingWatcher
 from ..temporary_deployment import (
     DeploymentError,
     DeploymentItem,
-    ShippingProcessWatcher,
     is_managed_mod_source,
     is_process_elevated,
 )
@@ -37,7 +37,7 @@ class MarvelRivalsFullDeploymentPlugin(mobase.IPlugin):
         mobase.IPlugin.__init__(self)
         self._organizer: mobase.IOrganizer | None = None
         self._manager: FullDeploymentManager | None = None
-        self._watcher: ShippingProcessWatcher | None = None
+        self._watcher: FullDeploymentShippingWatcher | None = None
 
     def init(self, organizer: mobase.IOrganizer) -> bool:
         self._organizer = organizer
@@ -61,7 +61,7 @@ class MarvelRivalsFullDeploymentPlugin(mobase.IPlugin):
         )
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo(0, 1, 0)
+        return mobase.VersionInfo(0, 2, 0)
 
     def settings(self) -> list[mobase.PluginSetting]:
         return [
@@ -269,7 +269,7 @@ class MarvelRivalsFullDeploymentPlugin(mobase.IPlugin):
 
             journal = manager.deploy(items)
             shipping_path = self._game_binary_path()
-            watcher = ShippingProcessWatcher(
+            watcher = FullDeploymentShippingWatcher(
                 manager,
                 shipping_process_name=shipping_path.name,
                 shipping_executable_path=shipping_path,
