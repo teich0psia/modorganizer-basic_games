@@ -31,6 +31,7 @@ from .marvelrivals.temporary_deployment import (
     DeploymentItem,
     ShippingProcessWatcher,
     TemporaryDeploymentManager,
+    is_managed_mod_source,
     is_process_elevated,
 )
 from .unreal_tabs.constants import DEFAULT_UE4SS_MODS, UE4SSModInfo
@@ -445,12 +446,6 @@ class MarvelRivalsGame(BasicGame):
                 file=sys.stderr,
             )
             return False
-        if not organizer.onFinishedRun(self._on_finished_run):
-            print(
-                "Failed to register Marvel Rivals onFinishedRun callback!",
-                file=sys.stderr,
-            )
-            return False
         self._recover_stale_deployment()
         return True
 
@@ -458,7 +453,7 @@ class MarvelRivalsGame(BasicGame):
         return [
             mobase.PluginSetting(
                 self.TemporaryRootDeploymentSetting,
-                "Use temporary Root deployment",
+                "Use Temporary Root Deployment instead of Forced Load",
                 False,
             )
         ]
@@ -493,6 +488,9 @@ class MarvelRivalsGame(BasicGame):
                 Path(self.dataDirectory().absolutePath()),
                 journal,
                 shipping_process_name=QFileInfo(self.binaryName()).fileName(),
+                shipping_executable_path=Path(
+                    self.gameDirectory().absoluteFilePath(self.GameBinary)
+                ),
                 log=self._log_temporary_deployment,
             )
         return self._temporary_manager
@@ -515,6 +513,7 @@ class MarvelRivalsGame(BasicGame):
             return []
 
         data_root = Path(self.dataDirectory().absolutePath())
+        mods_root = Path(self._organizer.modsPath())
         items: list[DeploymentItem] = []
 
         def collect(current: mobase.IFileTree, prefix: str = "") -> None:
@@ -542,6 +541,9 @@ class MarvelRivalsGame(BasicGame):
                     )
 
                 source = Path(source_value)
+                if not is_managed_mod_source(source, mods_root):
+                    continue
+
                 destination = data_root.joinpath(*virtual_path.split("/"))
                 if os.path.abspath(source).casefold() == os.path.abspath(
                     destination
@@ -587,8 +589,10 @@ class MarvelRivalsGame(BasicGame):
             journal = manager.deploy(items)
             watcher = ShippingProcessWatcher(
                 manager,
-                launcher_process_name=self.GameLauncher,
                 shipping_process_name=QFileInfo(self.binaryName()).fileName(),
+                shipping_executable_path=Path(
+                    self.gameDirectory().absoluteFilePath(self.GameBinary)
+                ),
                 session_started_at=journal.started_at,
                 log=self._log_temporary_deployment,
             )
@@ -598,13 +602,6 @@ class MarvelRivalsGame(BasicGame):
         except DeploymentError as error:
             self._show_deployment_error(error)
             return False
-
-    def _on_finished_run(self, binary: str, _result: int) -> None:
-        if not self._is_launcher(binary):
-            return
-        watcher = self._temporary_watcher
-        if watcher is not None:
-            watcher.notify_launcher_finished()
 
     def initTab(self, main_window: QMainWindow):
         if self._organizer.managedGame() != self:

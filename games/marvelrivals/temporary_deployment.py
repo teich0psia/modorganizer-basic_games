@@ -111,8 +111,102 @@ def _validate_windows_relative_path(value: str) -> PureWindowsPath:
     return path
 
 
+def _normalized_compare_path(path: Path) -> str:
+    value = os.path.abspath(os.fspath(path))
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    return os.path.normpath(value).casefold()
+
+
 def _same_path(left: Path, right: Path) -> bool:
-    return os.path.abspath(left).casefold() == os.path.abspath(right).casefold()
+    return _normalized_compare_path(left) == _normalized_compare_path(right)
+
+
+def _same_executable_path(left: Path, right: Path) -> bool:
+    if _same_path(left, right):
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
+def is_managed_mod_source(source: Path, mods_root: Path) -> bool:
+    try:
+        source_real = source.resolve(strict=True)
+        mods_real = mods_root.resolve(strict=True)
+        source_real.relative_to(mods_real)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _process_matches_target(
+    process: psutil.Process,
+    *,
+    expected_name: str,
+    expected_executable: Path | None,
+    min_created_at: float | None = None,
+) -> bool:
+    try:
+        info = getattr(process, "info", None)
+        if not isinstance(info, dict):
+            info = process.as_dict(attrs=["name", "exe", "create_time"])
+        process_name = info.get("name")
+        executable = info.get("exe")
+        created = info.get("create_time")
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+    if expected_executable is not None and executable:
+        if not _same_executable_path(Path(executable), expected_executable):
+            return False
+    elif not process_name or process_name.casefold() != expected_name.casefold():
+        return False
+
+    if (
+        min_created_at is not None
+        and isinstance(created, (int, float))
+        and created < min_created_at - 2.0
+    ):
+        return False
+    return True
+
+
+def _matching_processes(
+    *,
+    expected_name: str,
+    expected_executable: Path | None,
+    min_created_at: float | None = None,
+) -> list[psutil.Process]:
+    matches: list[psutil.Process] = []
+    for process in psutil.process_iter(["name", "exe", "create_time"]):
+        if _process_matches_target(
+            process,
+            expected_name=expected_name,
+            expected_executable=expected_executable,
+            min_created_at=min_created_at,
+        ):
+            matches.append(process)
+    return matches
+
+
+def _process_identity(process: object) -> tuple[int, float] | None:
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int):
+        return None
+
+    try:
+        info = getattr(process, "info", None)
+        created = info.get("create_time") if isinstance(info, dict) else None
+        if not isinstance(created, (int, float)):
+            created = process.create_time()  # type: ignore[attr-defined]
+    except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+        return None
+
+    if not isinstance(created, (int, float)):
+        return None
+    return pid, float(created)
 
 
 def _is_link_or_junction(path: Path) -> bool:
@@ -129,12 +223,18 @@ class TemporaryDeploymentManager:
         journal_path: Path,
         *,
         shipping_process_name: str,
+        shipping_executable_path: Path | None = None,
         log: DeploymentLogger | None = None,
     ) -> None:
         self.deployment_root = deployment_root.resolve()
         self.journal_path = journal_path
         self.lock_path = journal_path.with_suffix(journal_path.suffix + ".lock")
         self.shipping_process_name = shipping_process_name.casefold()
+        self.shipping_executable_path = (
+            shipping_executable_path.resolve(strict=False)
+            if shipping_executable_path is not None
+            else None
+        )
         self.owner_started_at = psutil.Process(os.getpid()).create_time()
         self._log = log or (lambda _message: None)
         self._lock_owned = False
@@ -251,14 +351,12 @@ class TemporaryDeploymentManager:
             self._lock_owned = False
 
     def shipping_running(self) -> bool:
-        for process in psutil.process_iter(["name"]):
-            try:
-                name = process.info.get("name")
-                if name and name.casefold() == self.shipping_process_name:
-                    return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return False
+        return bool(
+            _matching_processes(
+                expected_name=self.shipping_process_name,
+                expected_executable=self.shipping_executable_path,
+            )
+        )
 
     def _safe_destination(self, relative_path: str) -> Path:
         windows_path = _validate_windows_relative_path(relative_path)
@@ -391,7 +489,7 @@ class TemporaryDeploymentManager:
                 if not source.is_file() or source.is_symlink():
                     raise DeploymentError(f"Root mod source does not exist: {source}")
                 destination = self._safe_destination(item.relative_path)
-                key = os.path.abspath(destination).casefold()
+                key = _normalized_compare_path(destination)
                 if key in destinations:
                     raise DeploymentConflictError(
                         f"Multiple Root payloads target the same file: "
@@ -571,29 +669,32 @@ class ShippingProcessWatcher:
         self,
         manager: TemporaryDeploymentManager,
         *,
-        launcher_process_name: str,
         shipping_process_name: str,
         session_started_at: float,
-        launch_start_timeout: float = 45.0,
+        shipping_executable_path: Path | None = None,
         launch_timeout: float = 15.0 * 60.0,
-        launcher_exit_grace: float = 60.0,
         poll_interval: float = 1.0,
+        launcher_process_name: str | None = None,
+        launch_start_timeout: float | None = None,
+        launcher_exit_grace: float | None = None,
         log: DeploymentLogger | None = None,
     ) -> None:
         self.manager = manager
-        self.launcher_process_name = launcher_process_name.casefold()
+        self.launcher_process_name = (launcher_process_name or "").casefold()
         self.shipping_process_name = shipping_process_name.casefold()
+        self.shipping_executable_path = (
+            shipping_executable_path.resolve(strict=False)
+            if shipping_executable_path is not None
+            else None
+        )
         self.session_started_at = session_started_at
-        self.launch_start_timeout = launch_start_timeout
         self.launch_timeout = launch_timeout
-        self.launcher_exit_grace = launcher_exit_grace
         self.poll_interval = poll_interval
         self._log = log or (lambda _message: None)
-        self._launcher_finished = threading.Event()
         self._thread: threading.Thread | None = None
 
     def notify_launcher_finished(self) -> None:
-        self._launcher_finished.set()
+        return None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -606,86 +707,64 @@ class ShippingProcessWatcher:
         self._thread.start()
 
     def _matching_processes(self, name: str) -> list[psutil.Process]:
-        matches: list[psutil.Process] = []
-        for process in psutil.process_iter(["name", "create_time"]):
-            try:
-                process_name = process.info.get("name")
-                created = process.info.get("create_time")
-                if (
-                    process_name
-                    and process_name.casefold() == name
-                    and isinstance(created, (int, float))
-                    and created >= self.session_started_at - 2.0
-                ):
-                    matches.append(process)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return matches
+        if name != self.shipping_process_name:
+            return []
+        return _matching_processes(
+            expected_name=self.shipping_process_name,
+            expected_executable=self.shipping_executable_path,
+            min_created_at=self.session_started_at,
+        )
+
+    @staticmethod
+    def _describe_process(process: object) -> str:
+        try:
+            info = process.as_dict(attrs=["name", "exe", "create_time"])  # type: ignore[attr-defined]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+            info = {}
+        return (
+            f"pid={getattr(process, 'pid', '?')}, name={info.get('name')!r}, "
+            f"exe={info.get('exe')!r}, create_time={info.get('create_time')!r}"
+        )
 
     def _run(self) -> None:
         started = time.monotonic()
-        launcher_seen = False
         shipping_seen = False
-        launcher_disappeared_at: float | None = None
+        shipping_identity: tuple[int, float] | None = None
 
         while True:
-            now = time.monotonic()
-            elapsed = now - started
-            launchers = self._matching_processes(self.launcher_process_name)
             shipping = self._matching_processes(self.shipping_process_name)
 
-            if launchers:
-                if not launcher_seen:
-                    self._log("Marvel Rivals launcher detected")
-                launcher_seen = True
-                launcher_disappeared_at = None
+            if shipping_seen and shipping_identity is not None:
+                shipping = [
+                    process
+                    for process in shipping
+                    if _process_identity(process) == shipping_identity
+                ]
 
             if shipping:
                 if not shipping_seen:
-                    self._log("Marvel-Win64-Shipping.exe detected")
-                shipping_seen = True
+                    shipping_seen = True
+                    shipping_identity = _process_identity(shipping[0])
+                    self._log(
+                        "Marvel-Win64-Shipping.exe detected "
+                        f"({self._describe_process(shipping[0])})"
+                    )
+                time.sleep(self.poll_interval)
+                continue
 
             if shipping_seen:
-                if shipping:
-                    time.sleep(self.poll_interval)
-                    continue
                 self._log(
                     "Marvel-Win64-Shipping.exe exited; cleaning temporary Root payloads"
                 )
                 self.manager.cleanup()
                 return
 
-            if elapsed >= self.launch_timeout:
+            if time.monotonic() - started >= self.launch_timeout:
                 self._log(
-                    "Marvel Rivals launch timed out; cleaning temporary Root payloads"
+                    "Marvel Rivals launch timed out before Shipping.exe was "
+                    "detected; cleaning temporary Root payloads"
                 )
                 self.manager.cleanup()
                 return
-
-            if not launcher_seen and elapsed >= self.launch_start_timeout:
-                self._log(
-                    "Marvel Rivals launcher was not detected; cleaning temporary "
-                    "Root payloads"
-                )
-                self.manager.cleanup()
-                return
-
-            launcher_finished = self._launcher_finished.is_set()
-            if launcher_seen and not launchers:
-                if launcher_disappeared_at is None:
-                    launcher_disappeared_at = now
-                # onFinishedRun is only an abort hint here. Shipping.exe remains the
-                # final cleanup condition once it has been observed. A grace window also
-                # covers launchers that exit shortly before spawning the game process.
-                if (
-                    launcher_finished
-                    and now - launcher_disappeared_at >= self.launcher_exit_grace
-                ):
-                    self._log(
-                        "Marvel Rivals launcher exited without starting the game; "
-                        "cleaning temporary Root payloads"
-                    )
-                    self.manager.cleanup()
-                    return
 
             time.sleep(self.poll_interval)
