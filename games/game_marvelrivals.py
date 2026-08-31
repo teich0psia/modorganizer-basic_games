@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import sys
 from enum import IntEnum, auto
 from functools import cached_property
 from pathlib import Path
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -24,6 +26,13 @@ from PyQt6.QtWidgets import (
 import mobase
 
 from ..basic_game import BasicGame
+from .marvelrivals.temporary_deployment import (
+    DeploymentError,
+    DeploymentItem,
+    ShippingProcessWatcher,
+    TemporaryDeploymentManager,
+    is_process_elevated,
+)
 from .unreal_tabs.constants import DEFAULT_UE4SS_MODS, UE4SSModInfo
 from .unreal_tabs.manage_paks.widget import PaksTabWidget
 from .unreal_tabs.manage_ue4ss.widget import UE4SSTabWidget
@@ -404,7 +413,7 @@ class MarvelRivalsGame(BasicGame):
     Author = "ModWorkshop"
     Version = "1"
     GameName = "Marvel Rivals"
-    GameLauncher = "Marvel.exe"
+    GameLauncher = "MarvelRivals_Launcher.exe"
     GameShortName = "MarvelRivals"
     GameSteamId = 2767030
     GameBinary = "MarvelGame/Marvel/Binaries/Win64/Marvel-Win64-Shipping.exe"
@@ -415,17 +424,187 @@ class MarvelRivalsGame(BasicGame):
     GameDocumentsDirectory = "%LOCALAPPDATA%/MarvelGame/Saved/Config/Windows"
     GameSavesDirectory = "%LOCALAPPDATA%/MarvelGame/Saved/SaveGames"
     GameSaveExtension = "sav"
+    TemporaryRootDeploymentSetting = "temporary_root_deployment"
     _main_window: QMainWindow
     _ue4ss_tab: UE4SSTabWidget
     _paks_tab: PaksTabWidget
+    _temporary_manager: TemporaryDeploymentManager | None
+    _temporary_watcher: ShippingProcessWatcher | None
 
     def init(self, organizer: mobase.IOrganizer) -> bool:
         super().init(organizer)
+        self._temporary_manager = None
+        self._temporary_watcher = None
         self.dataChecker = MarvelRivalsModDataChecker(organizer)
         self._register_feature(self.dataChecker)
         self._register_feature(MarvelRivalsModDataContent())
         organizer.onUserInterfaceInitialized(self.initTab)
+        if not organizer.onAboutToRun(self._on_about_to_run):
+            print(
+                "Failed to register Marvel Rivals onAboutToRun callback!",
+                file=sys.stderr,
+            )
+            return False
+        if not organizer.onFinishedRun(self._on_finished_run):
+            print(
+                "Failed to register Marvel Rivals onFinishedRun callback!",
+                file=sys.stderr,
+            )
+            return False
+        self._recover_stale_deployment()
         return True
+
+    def settings(self) -> list[mobase.PluginSetting]:
+        return [
+            mobase.PluginSetting(
+                self.TemporaryRootDeploymentSetting,
+                "Use temporary Root deployment",
+                False,
+            )
+        ]
+
+    def _log_temporary_deployment(self, message: str) -> None:
+        print(f"[Marvel Rivals] {message}", file=sys.stderr)
+
+    def _temporary_deployment_enabled(self) -> bool:
+        organizer = getattr(self, "_organizer", None)
+        if organizer is None:
+            return False
+        return bool(
+            organizer.pluginSetting(self.name(), self.TemporaryRootDeploymentSetting)
+        )
+
+    def _launcher_path(self) -> Path:
+        return Path(self.gameDirectory().absoluteFilePath(self.GameLauncher))
+
+    def _is_launcher(self, binary: str) -> bool:
+        return os.path.abspath(binary).casefold() == os.path.abspath(
+            self._launcher_path()
+        ).casefold()
+
+    def _get_temporary_manager(self) -> TemporaryDeploymentManager:
+        if self._temporary_manager is None:
+            journal = (
+                Path(self._organizer.pluginDataPath())
+                / "marvelrivals"
+                / "temporary_root_deployment.json"
+            )
+            self._temporary_manager = TemporaryDeploymentManager(
+                Path(self.dataDirectory().absolutePath()),
+                journal,
+                shipping_process_name=QFileInfo(self.binaryName()).fileName(),
+                log=self._log_temporary_deployment,
+            )
+        return self._temporary_manager
+
+    def _recover_stale_deployment(self) -> None:
+        if not self.isInstalled() or not self.dataDirectory().exists():
+            return
+        try:
+            self._get_temporary_manager().recover_stale()
+        except DeploymentError as error:
+            self._log_temporary_deployment(f"stale recovery failed: {error}")
+
+    def _discover_root_payloads(self) -> list[DeploymentItem]:
+        tree = self._organizer.virtualFileTree()
+        if not isinstance(tree, mobase.IFileTree):
+            return []
+
+        root_entry = tree.find(self.GameDataUE4SSRoot, mobase.IFileTree.DIRECTORY)
+        if not isinstance(root_entry, mobase.IFileTree):
+            return []
+
+        data_root = Path(self.dataDirectory().absolutePath())
+        items: list[DeploymentItem] = []
+
+        def collect(current: mobase.IFileTree, prefix: str = "") -> None:
+            for entry in current:
+                name = entry.name()
+                relative = f"{prefix}/{name}" if prefix else name
+
+                if entry.isDir():
+                    if not prefix and name.casefold() == "mods":
+                        continue
+                    if isinstance(entry, mobase.IFileTree):
+                        collect(entry, relative)
+                    continue
+
+                if not entry.isFile():
+                    continue
+
+                virtual_path = f"{self.GameDataUE4SSRoot}/{relative}".replace(
+                    "\\", "/"
+                )
+                source_value = self._organizer.resolvePath(virtual_path)
+                if not source_value:
+                    raise DeploymentError(
+                        f"Could not resolve Root mod source: {virtual_path}"
+                    )
+
+                source = Path(source_value)
+                destination = data_root.joinpath(*virtual_path.split("/"))
+                if os.path.abspath(source).casefold() == os.path.abspath(
+                    destination
+                ).casefold():
+                    continue
+
+                items.append(DeploymentItem(str(source), virtual_path))
+
+        collect(root_entry)
+        return items
+
+    def _show_deployment_error(self, error: DeploymentError) -> None:
+        QMessageBox.critical(
+            getattr(self, "_main_window", None),
+            "Marvel Rivals",
+            str(error),
+        )
+
+    def _on_about_to_run(self, binary: str, _cwd: QDir, _args: str) -> bool:
+        if not self._is_launcher(binary) or not self._temporary_deployment_enabled():
+            return True
+
+        # MO2 reports ERROR_ELEVATION_REQUIRED only after onAboutToRun. Deferring all
+        # physical writes here ensures the non-elevated instance cannot leave a partial
+        # deployment behind when MO2 restarts itself as administrator.
+        if not is_process_elevated():
+            self._log_temporary_deployment(
+                "MO2 is not elevated; deferring temporary Root deployment"
+            )
+            return True
+
+        manager = self._get_temporary_manager()
+        try:
+            if not manager.recover_stale():
+                raise DeploymentError(
+                    "An existing Marvel Rivals deployment session is still active."
+                )
+            items = self._discover_root_payloads()
+            if not items:
+                self._log_temporary_deployment("no enabled Root payloads found")
+                return True
+
+            journal = manager.deploy(items)
+            watcher = ShippingProcessWatcher(
+                manager,
+                launcher_process_name=self.GameLauncher,
+                shipping_process_name=QFileInfo(self.binaryName()).fileName(),
+                session_started_at=journal.started_at,
+                log=self._log_temporary_deployment,
+            )
+            self._temporary_watcher = watcher
+            watcher.start()
+            return True
+        except DeploymentError as error:
+            self._show_deployment_error(error)
+            return False
+
+    def _on_finished_run(self, binary: str, _result: int) -> None:
+        if not self._is_launcher(binary):
+            return
+        watcher = self._temporary_watcher
+        if watcher is not None:
+            watcher.notify_launcher_finished()
 
     def initTab(self, main_window: QMainWindow):
         if self._organizer.managedGame() != self:
@@ -448,7 +627,7 @@ class MarvelRivalsGame(BasicGame):
         return [
             mobase.ExecutableInfo(
                 "Marvel Rivals",
-                QFileInfo(self.gameDirectory().absoluteFilePath(self.binaryName())),
+                QFileInfo(self.gameDirectory().absoluteFilePath(self.GameLauncher)),
             )
         ]
 
@@ -462,6 +641,9 @@ class MarvelRivalsGame(BasicGame):
             efls = super().executableForcedLoads()
         except AttributeError:
             efls = []
+        if self._temporary_deployment_enabled():
+            return efls
+
         libs: set[str] = set()
         tree: mobase.IFileTree | mobase.FileTreeEntry | None = (
             self._organizer.virtualFileTree()
@@ -472,15 +654,12 @@ class MarvelRivalsGame(BasicGame):
             relpath = e.pathFrom(tree)
             if relpath and e.hasSuffix("dll") and relpath not in self.baseDlls:
                 libs.add(relpath)
-        exes = self.executables()
-        efls = efls + [
-            mobase.ExecutableForcedLoadSetting(
-                exe.binary().fileName(), lib
-            ).withEnabled(True)
+
+        shipping_binary = QFileInfo(self.binaryName()).fileName()
+        return efls + [
+            mobase.ExecutableForcedLoadSetting(shipping_binary, lib).withEnabled(True)
             for lib in libs
-            for exe in exes
         ]
-        return efls
 
     def writeDefaultMods(self, profile: QDir):
         ue4ss_mods_txt = QFileInfo(profile.absoluteFilePath("mods.txt"))
