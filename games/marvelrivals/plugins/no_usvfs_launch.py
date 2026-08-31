@@ -15,6 +15,7 @@ from ..usvfs_blacklist import UsvfsBlacklistError, blacklist_executable
 class MarvelRivalsNoUsvfsLaunchPlugin(mobase.IPlugin):
     GameShortName = "MarvelRivals"
     LauncherName = "MarvelRivals_Launcher.exe"
+    LaunchWithoutUsvfsSetting = "launch_without_usvfs"
 
     def __init__(self) -> None:
         mobase.IPlugin.__init__(self)
@@ -34,18 +35,38 @@ class MarvelRivalsNoUsvfsLaunchPlugin(mobase.IPlugin):
     def description(self) -> str:
         return (
             "Experimental Marvel Rivals launch mode that prevents USVFS injection "
-            "into the game launcher. Disabled by default. Restart Mod Organizer 2 "
-            "after disabling it to restore normal VFS launch behavior."
+            "into the game launcher. The plugin stays active so it can receive MO2 "
+            "launch callbacks; the launch mode itself is disabled by default. Restart "
+            "Mod Organizer 2 after turning the launch mode off to restore VFS in the "
+            "current session."
         )
 
     def version(self) -> mobase.VersionInfo:
-        return mobase.VersionInfo(0, 1, 0)
+        return mobase.VersionInfo(0, 2, 0)
 
     def settings(self) -> list[mobase.PluginSetting]:
-        return []
+        return [
+            mobase.PluginSetting(
+                self.LaunchWithoutUsvfsSetting,
+                "Launch Marvel Rivals without USVFS (experimental)",
+                False,
+            )
+        ]
 
     def enabledByDefault(self) -> bool:
-        return False
+        organizer = self._organizer
+        if organizer is None:
+            return False
+        game = organizer.managedGame()
+        return game is not None and game.gameShortName() == self.GameShortName
+
+    def _launch_mode_enabled(self) -> bool:
+        organizer = self._organizer
+        if organizer is None:
+            return False
+        return bool(
+            organizer.pluginSetting(self.name(), self.LaunchWithoutUsvfsSetting)
+        )
 
     def _target_launcher(self) -> Path | None:
         organizer = self._organizer
@@ -65,7 +86,11 @@ class MarvelRivalsNoUsvfsLaunchPlugin(mobase.IPlugin):
         return os.path.abspath(binary).casefold() == os.path.abspath(launcher).casefold()
 
     def _on_about_to_run(self, binary: str, _cwd: QDir, _args: str) -> bool:
-        if not self._is_target_launcher(binary) or self._blacklisted:
+        if (
+            not self._launch_mode_enabled()
+            or not self._is_target_launcher(binary)
+            or self._blacklisted
+        ):
             return True
 
         try:
