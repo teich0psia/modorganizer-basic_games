@@ -6,6 +6,7 @@ import types
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,7 @@ class FakeIFileTree:
 mobase = cast(Any, types.ModuleType("mobase"))
 mobase.IPlugin = FakeIPlugin
 mobase.IOrganizer = object
+mobase.IPluginGame = object
 mobase.IFileTree = FakeIFileTree
 mobase.PluginSetting = FakePluginSetting
 mobase.VersionInfo = FakeVersionInfo
@@ -77,6 +79,24 @@ class FakeFullDeploymentManager:
 full_backend.FullDeploymentManager = FakeFullDeploymentManager
 sys.modules["games.marvelrivals.full_deployment"] = full_backend
 
+
+class FakeFullDeploymentShippingWatcher:
+    instances: list["FakeFullDeploymentShippingWatcher"] = []
+
+    def __init__(self, manager, **kwargs) -> None:
+        self.manager = manager
+        self.kwargs = kwargs
+        self.start_count = 0
+        self.__class__.instances.append(self)
+
+    def start(self) -> None:
+        self.start_count += 1
+
+
+full_watcher = cast(Any, types.ModuleType("games.marvelrivals.full_watcher"))
+full_watcher.FullDeploymentShippingWatcher = FakeFullDeploymentShippingWatcher
+sys.modules["games.marvelrivals.full_watcher"] = full_watcher
+
 temporary = cast(Any, types.ModuleType("games.marvelrivals.temporary_deployment"))
 
 
@@ -90,13 +110,8 @@ class FakeDeploymentItem:
         self.relative_path = relative_path
 
 
-class FakeShippingProcessWatcher:
-    pass
-
-
 temporary.DeploymentError = FakeDeploymentError
 temporary.DeploymentItem = FakeDeploymentItem
-temporary.ShippingProcessWatcher = FakeShippingProcessWatcher
 temporary.is_managed_mod_source = lambda _source, _mods: True
 temporary.is_process_elevated = lambda: True
 sys.modules["games.marvelrivals.temporary_deployment"] = temporary
@@ -182,11 +197,11 @@ class TestFullDeploymentPlugin(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin = module.MarvelRivalsFullDeploymentPlugin()
         FakeMessageBox.calls = []
+        FakeFullDeploymentShippingWatcher.instances = []
         self.original_elevated = module.is_process_elevated
         self.addCleanup(setattr, module, "is_process_elevated", self.original_elevated)
 
     def initialize(self, organizer: FakeOrganizer) -> None:
-        # Avoid filesystem stale-recovery work in orchestration tests.
         self.plugin._recover_stale_deployment = lambda: None
         self.assertTrue(self.plugin.init(organizer))
 
@@ -262,6 +277,44 @@ class TestFullDeploymentPlugin(unittest.TestCase):
         self.initialize(organizer)
         self.assertTrue(self.plugin._on_about_to_run("/game/Other.exe", FakeQDir(), ""))
         self.assertEqual(FakeMessageBox.calls, [])
+
+    def test_successful_deployment_starts_shipping_watcher(self) -> None:
+        organizer = FakeOrganizer(full=True, root=False, no_usvfs=True)
+        self.initialize(organizer)
+
+        class Manager:
+            def __init__(self) -> None:
+                self.deploy_count = 0
+
+            def recover_stale(self) -> bool:
+                return True
+
+            def deploy(self, items):
+                self.deploy_count += 1
+                self.items = list(items)
+                return SimpleNamespace(started_at=123.0)
+
+        manager = Manager()
+        self.plugin._get_manager = lambda: manager
+        self.plugin._discover_payloads = lambda: [
+            FakeDeploymentItem("/mods/dsound.dll", "Binaries/Win64/dsound.dll")
+        ]
+
+        self.assertTrue(
+            self.plugin._on_about_to_run(
+                "/game/MarvelRivals_Launcher.exe", FakeQDir(), ""
+            )
+        )
+
+        self.assertEqual(manager.deploy_count, 1)
+        self.assertEqual(len(FakeFullDeploymentShippingWatcher.instances), 1)
+        watcher = FakeFullDeploymentShippingWatcher.instances[0]
+        self.assertEqual(watcher.start_count, 1)
+        self.assertIs(self.plugin._watcher, watcher)
+        self.assertEqual(
+            watcher.kwargs["shipping_process_name"], "Marvel-Win64-Shipping.exe"
+        )
+        self.assertEqual(watcher.kwargs["session_started_at"], 123.0)
 
 
 if __name__ == "__main__":
